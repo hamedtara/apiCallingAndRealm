@@ -1,69 +1,114 @@
 import React, { useState, useEffect } from 'react';
-import { SafeAreaView, View, Text, Button, StyleSheet } from 'react-native';
+import { SafeAreaView, View, Text, Button, StyleSheet, ActivityIndicator, Switch } from 'react-native';
 import axios from 'axios';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import Realm from 'realm';
+
+const JokeSchema = {
+  name: 'Joke',
+  primaryKey: '_id',
+  properties: {
+    _id: 'int',
+    setup: 'string',
+    punchline: 'string',
+  },
+};
+
+let realm;
 
 const App = () => {
   const [joke, setJoke] = useState(null);
   const [error, setError] = useState(null);
   const [storedJokes, setStoredJokes] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [viewedJokes, setViewedJokes] = useState([]);
+  const [online, setOnline] = useState(true);
 
   const fetchJoke = async () => {
+    setLoading(true);
     try {
-      const response = await axios.get('https://official-joke-api.appspot.com/random_joke');
-      setJoke(response.data);
-      setError(null); 
+      const netInfo = await NetInfo.fetch();
 
-      await AsyncStorage.setItem('joke', JSON.stringify(response.data));
+      if (online || netInfo.isConnected) {
+        const response = await axios.get('https://official-joke-api.appspot.com/random_joke');
+        setJoke(response.data);
+        setViewedJokes(prevJokes => [...prevJokes, response.data].slice(-3));
+        setError(null);
+      } else {
+        if (storedJokes.length > 0) {
+          const nextJoke = storedJokes[currentIndex % storedJokes.length];
+          setJoke(nextJoke);
+          setCurrentIndex(currentIndex + 1);
+        } else {
+          setError('No stored jokes available. Please check your internet connection.');
+        }
+      }
     } catch (error) {
       console.error('Error fetching joke:', error);
-      setError('Failed to fetch joke. Please check your internet connection.'); 
+      setError('Failed to fetch joke. Please check your internet connection.');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const fetchStoredJokes = async () => {
+  const toggleOnlineMode = () => {
+    setOnline(!online);
+  };
+
+  const saveJokes = () => {
     try {
-      // Retrieve stored jokes from AsyncStorage
-      const storedJokes = await AsyncStorage.getItem('jokes');
-      if (storedJokes) {
-        setStoredJokes(JSON.parse(storedJokes));
-      }
+      realm.write(() => {
+        realm.delete(realm.objects('Joke'));
+        viewedJokes.forEach(joke => {
+          realm.create('Joke', {
+            _id: joke.id,
+            setup: joke.setup,
+            punchline: joke.punchline,
+          }, Realm.UpdateMode.All);
+        });
+      });
+      fetchStoredJokes();
     } catch (error) {
-      console.error('Error fetching stored jokes:', error);
+      console.error('Error saving jokes:', error);
     }
   };
 
-  const fetchAndSaveJokes = async () => {
-    try {
-      const jokes = [];
-      for (let i = 0; i < 10; i++) {
-        const response = await axios.get('https://official-joke-api.appspot.com/random_joke');
-        jokes.push(response.data);
-      }
-      setStoredJokes(jokes);
-      await AsyncStorage.setItem('jokes', JSON.stringify(jokes));
-    } catch (error) {
-      console.error('Error fetching and saving jokes:', error);
-    }
+  const fetchStoredJokes = () => {
+    const jokes = realm.objects('Joke').sorted('_id');
+    setStoredJokes(Array.from(jokes));
   };
 
   useEffect(() => {
-    // Check internet connection
-    const unsubscribe = NetInfo.addEventListener((state) => {
+    realm = new Realm({ schema: [JokeSchema], schemaVersion: 1 });
+
+    fetchStoredJokes();
+    if (storedJokes.length < 3) {
+      Promise.all(new Array(3).fill(null).map(() => axios.get('https://official-joke-api.appspot.com/random_joke')))
+        .then(responses => {
+          responses.forEach(response => {
+            realm.write(() => {
+              realm.create('Joke', {
+                _id: response.data.id,
+                setup: response.data.setup,
+                punchline: response.data.punchline,
+              }, Realm.UpdateMode.All);
+            });
+          });
+          fetchStoredJokes();
+        })
+        .catch(error => console.error('Initial joke fetch failed:', error));
+    }
+
+    const unsubscribe = NetInfo.addEventListener(state => {
       if (!state.isConnected) {
-        fetchStoredJokes();
-      }
+        fetchStoredJokes();}
     });
 
-    // Check if there are stored jokes, if not, fetch and save 10 jokes
-    fetchStoredJokes().then(() => {
-      if (storedJokes.length === 0) {
-        fetchAndSaveJokes();
-      }
-    });
-
-    return () => unsubscribe(); // Clean up subscription
+    return () => {
+      unsubscribe();
+      realm.close();
+    };
   }, []);
 
   return (
@@ -73,33 +118,23 @@ const App = () => {
           <Text style={styles.errorMessage}>{error}</Text>
         ) : (
           <View>
+            {loading && <ActivityIndicator size="large" color="#0000ff" />}
             {joke ? (
               <View>
                 <Text style={styles.jokeSetup}>{joke.setup}</Text>
                 <Text style={styles.jokePunchline}>{joke.punchline}</Text>
-                <Button title="Get Another Joke" onPress={fetchJoke} />
               </View>
             ) : (
-              storedJokes.length > 0 && (
-                <View>
-                  <Text style={styles.jokeSetup}>{storedJokes[0].setup}</Text>
-                  <Text style={styles.jokePunchline}>{storedJokes[0].punchline}</Text>
-                  <Button
-                    title="Get Another Joke"
-                    onPress={() => {
-                      if (storedJokes.length === 1) {
-                        setStoredJokes(storedJokes); // To trigger a re-render and reset to the first joke
-                      } else {
-                        setStoredJokes(storedJokes.slice(1).concat(storedJokes[0]));
-                      }
-                    }}
-                    disabled={storedJokes.length === 1}
-                  />
-                </View>
-              )
+              <Text style={styles.noJokeMessage}>Press the button to get a joke!</Text>
             )}
           </View>
         )}
+      </View>
+      <View style={styles.buttonContainer}>
+        <Button title="Get Another Joke" onPress={fetchJoke} disabled={loading} />
+        <Button title="Save Jokes" onPress={saveJokes} />
+        <Switch value={online} onValueChange={toggleOnlineMode} />
+        <Text style={styles.onlineStatus}>{online ? 'Online' : 'Offline'}</Text>
       </View>
     </SafeAreaView>
   );
@@ -130,6 +165,22 @@ const styles = StyleSheet.create({
     fontSize: 16,
     marginBottom: 20,
     textAlign: 'center',
+  },
+  noJokeMessage: {
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  buttonContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '80%',
+    marginTop: 20,
+  },
+  onlineStatus: {
+    fontSize: 16,
+    textAlign: 'center',
+    marginLeft: 10,
   },
 });
 
